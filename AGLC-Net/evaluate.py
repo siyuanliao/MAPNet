@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""AGLC-Net Stage II evaluation: valid-water RMSE/MAE, same mask as MAP-Net.
+
+Requires a Stage II checkpoint and its training-only reference bank.
+"""
+from __future__ import annotations
+import argparse
+from contextlib import nullcontext
+from pathlib import Path, PurePosixPath, PureWindowsPath
+import pickle
+import json
+import math
+import torch.distributed as dist
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Subset
+
+from aglc_net.data import TLDataset, SPLIT_SLICES, check_files
+from aglc_net.metrics import LOSS_POLICY
+from aglc_net.model import build_model, count_parameters, MODEL_ARCHITECTURE
+from aglc_net.paths import DEFAULT_DATA_DIR, DEFAULT_OUTPUT_DIR, DEFAULT_CHECKPOINT
+from train import file_sha256
+
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = DEFAULT_DATA_DIR
+CHECKPOINT = DEFAULT_CHECKPOINT
+OUTPUT_DIR = DEFAULT_OUTPUT_DIR / 'evaluation'
+# Set EVALUATE_FULL_SPLIT=False to evaluate SAMPLE_IDS only.
+SPLIT = 'test'
+SAMPLE_IDS = [17424, 17600]
+EVALUATE_FULL_SPLIT = True
+BATCH_SIZE = 2
+NUM_WORKERS = 0
+AMP = 'auto'
+ANGLE_CHUNK = 3
+
+
+class CrossPlatformUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module in ('pathlib', 'pathlib._local'):
+            if name == 'PosixPath': return PurePosixPath
+            if name == 'WindowsPath': return PureWindowsPath
+        return super().find_class(module, name)
+
+
+class CrossPlatformPickle:
+    Unpickler = CrossPlatformUnpickler
+
+
+
+
+# Water-column evaluation
+# Water-column metrics are implemented locally for standalone evaluation.
+def water_valid_mask(target, sample_ids, bottom_idx):
+    """按原始样本编号生成掩码，并排除真实TL的非有限值。"""
+    if target.ndim != 4 or target.shape[1:] != (9, 200, 250):
+        raise ValueError(f"TL shape must be [B,9,200,250], got {tuple(target.shape)}")
+    # 注意：sample_ids为18876条数据的原始样本编号，而不是当前batch内的索引。
+    src = sample_ids.to(device=target.device, dtype=torch.long) % 121
+    h = bottom_idx[src].to(torch.long)
+    z = torch.arange(200, device=target.device).view(1, 1, 200, 1)
+
+
+    return (z <= h.unsqueeze(2)) & torch.isfinite(target)
+
+class MaskedMetrics:
+    """按所有有效水体网格点聚合误差，避免对每个Batch的RMSE求平均。"""
+
+    def __init__(self, device):
+        self.device = torch.device(device)
+        self.sse = torch.zeros((), device=device, dtype=torch.float64)
+        self.sae = torch.zeros((), device=device, dtype=torch.float64)
+        self.n = torch.zeros((), device=device, dtype=torch.float64)
+        self.angle_sse = torch.zeros(9, device=device, dtype=torch.float64)
+        self.angle_sae = torch.zeros(9, device=device, dtype=torch.float64)
+        self.angle_n = torch.zeros(9, device=device, dtype=torch.float64)
+        self.range_sse = torch.zeros(5, device=device, dtype=torch.float64)
+        self.range_sae = torch.zeros(5, device=device, dtype=torch.float64)
+        self.range_n = torch.zeros(5, device=device, dtype=torch.float64)
+        self.depth_sse = torch.zeros(4, device=device, dtype=torch.float64)
+        self.depth_sae = torch.zeros(4, device=device, dtype=torch.float64)
+        self.depth_n = torch.zeros(4, device=device, dtype=torch.float64)
+        self.nonfinite = torch.zeros((), device=device, dtype=torch.int64)
+
+    @torch.no_grad()
+    def add(self, pred_db, target_db, valid):
+        # 水体外及真实TL非有限点不纳入误差，分组边界沿用原始物理网格。
+        self.nonfinite += (valid & ~torch.isfinite(pred_db)).sum()
+        err = torch.where(valid, pred_db.float(), 0.0) - torch.where(valid, target_db.float(), 0.0)
+        abs_err = err.abs().double()
+        sq_err = err.square().double()
+        self.sse += sq_err.sum()
+        self.sae += abs_err.sum()
+        self.n += valid.sum().double()
+        self.angle_sse += sq_err.sum(dim=(0, 2, 3))
+        self.angle_sae += abs_err.sum(dim=(0, 2, 3))
+        self.angle_n += valid.sum(dim=(0, 2, 3)).double()
+
+        self.range_sse += sq_err.reshape(-1, 5, 50).sum(dim=(0, 2))
+        self.range_sae += abs_err.reshape(-1, 5, 50).sum(dim=(0, 2))
+        self.range_n += valid.reshape(-1, 5, 50).sum(dim=(0, 2)).double()
+        self.depth_sse += sq_err.reshape(-1, 4, 50, 250).sum(dim=(0, 2, 3))
+        self.depth_sae += abs_err.reshape(-1, 4, 50, 250).sum(dim=(0, 2, 3))
+        self.depth_n += valid.reshape(-1, 4, 50, 250).sum(dim=(0, 2, 3)).double()
+
+    def sync(self):
+        if dist.is_available() and dist.is_initialized():
+            # 统一规约，减少分布式验证时的通信次数。
+            names = (
+                "sse", "sae", "n", "angle_sse", "angle_sae", "angle_n",
+                "range_sse", "range_sae", "range_n", "depth_sse", "depth_sae", "depth_n",
+            )
+            shape = [getattr(self, name).shape for name in names]
+            packed = torch.cat([getattr(self, name).reshape(-1) for name in names])
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+            idx = 0
+            for name, size in zip(names, shape):
+                length = math.prod(size)
+                getattr(self, name).copy_(packed[idx:idx + length].reshape(size))
+                idx += length
+            dist.all_reduce(self.nonfinite, op=dist.ReduceOp.SUM)
+
+    def result(self):
+        if int(self.nonfinite.item()) > 0:
+            raise FloatingPointError("有效水体区域的预测TL含NaN/Inf，无法计算评价指标")
+
+        def one(sse, sae, n):
+            n = float(n.item())
+            if n == 0:
+                return {"mae_db": None, "rmse_db": None, "valid_points": 0}
+            return {
+                "mae_db": float(sae.item() / n),
+                "rmse_db": math.sqrt(max(0.0, float(sse.item() / n))),
+                "valid_points": int(n),
+            }
+
+        return {
+            "overall": one(self.sse, self.sae, self.n),
+            "per_angle": {f"{k*40}deg": one(self.angle_sse[k], self.angle_sae[k], self.angle_n[k]) for k in range(9)},
+            "per_range_km": {f"{10*k}-{10*(k+1)}": one(self.range_sse[k], self.range_sae[k], self.range_n[k]) for k in range(5)},
+            "per_depth_m": {f"{1000*k}-{1000*(k+1)}": one(self.depth_sse[k], self.depth_sae[k], self.depth_n[k]) for k in range(4)},
+        }
+
+
+def _load_bottom_index(data_dir, device):
+    """读取同 MAP-Net 的海底深度索引；不存在或形状错误时立即终止。"""
+    bottom_path = Path(data_dir) / "bottom_depth_index_r2.npy"
+    if not bottom_path.is_file():
+        raise FileNotFoundError(
+            f"缺少用于有效水体评价的文件：{bottom_path}。"
+            " 请使用与 MAP-Net 评价相同的 bottom_depth_index_r2.npy。"
+        )
+    bottom = np.load(bottom_path, allow_pickle=False)
+    if bottom.shape != (121, 9, 250):
+        raise ValueError(f"海底深度索引必须是 (121,9,250)，实际为 {bottom.shape}")
+    # 与 MAP-Net 保持一致：不改变原文件类型，water_valid_mask 内统一转换为 long。
+    return torch.from_numpy(np.array(bottom, copy=True)).to(device)
+
+
+def _sample_rmse_mae_db(pred_db, true_db, valid_mask):
+    """逐样本有效水体 RMSE 和 MAE（dB）；必须显式传入 water_valid_mask。"""
+    if pred_db.shape != true_db.shape or valid_mask.shape != true_db.shape:
+        raise ValueError("pred_db、true_db、valid_mask 形状必须完全一致。")
+    valid = valid_mask.to(torch.bool)
+    counts = valid.flatten(start_dim=1).sum(dim=1)
+    if bool((counts == 0).any()):
+        raise ValueError("存在无有效水体评价网格的样本。")
+    if bool(((~torch.isfinite(pred_db) | ~torch.isfinite(true_db)) & valid).any()):
+        raise FloatingPointError("有效水体区域出现 NaN/Inf，不能计算误差。")
+    # 将无效点先替换为零，再作差，避免 NaN 在无效点传播到误差统计。
+    p = torch.where(valid, pred_db.detach().to(torch.float64), 0.0)
+    t = torch.where(valid, true_db.detach().to(torch.float64), 0.0)
+    residual = (p - t).flatten(start_dim=1)
+    n = counts.to(torch.float64)
+    rmse = (residual.square().sum(dim=1) / n).sqrt()
+    mae = residual.abs().sum(dim=1) / n
+    return rmse.cpu().numpy(), mae.cpu().numpy()
+
+
+def _save_sample_errors(output_dir, filename, model_name, split, lo, hi,
+                        evaluate_full_split, collected_ids, collected_rmse,
+                        collected_mae, metric_scope):
+    """按原始样本编号升序保存 RMSE、MAE，并检查三者严格一一对应。"""
+    sample_ids = np.asarray(collected_ids, dtype=np.int64)
+    rmse_db = np.asarray(collected_rmse, dtype=np.float64)
+    mae_db = np.asarray(collected_mae, dtype=np.float64)
+    if not (len(sample_ids) == len(rmse_db) == len(mae_db)) or len(sample_ids) == 0:
+        raise RuntimeError("逐样本编号、RMSE 和 MAE 数量不一致或为空。")
+
+    order = np.argsort(sample_ids)
+    sample_ids = sample_ids[order]
+    rmse_db = rmse_db[order]
+    mae_db = mae_db[order]
+    if len(np.unique(sample_ids)) != len(sample_ids):
+        raise RuntimeError("测试数据中出现重复的原始样本编号，已停止导出。")
+    if evaluate_full_split and not np.array_equal(sample_ids, np.arange(lo, hi, dtype=np.int64)):
+        raise RuntimeError(
+            f"完整划分样本编号不连续或不完整：预期 [{lo}, {hi-1}] 共 {hi-lo} 条，"
+            f"实际 {len(sample_ids)} 条。"
+        )
+    if not np.isfinite(rmse_db).all() or not np.isfinite(mae_db).all():
+        raise RuntimeError("逐样本 RMSE/MAE 中出现 NaN/Inf，已停止导出。")
+
+    path = output_dir / filename
+    np.savez_compressed(
+        path,
+        sample_ids=sample_ids,   # [N] 0-based 原始全局编号
+        rmse_db=rmse_db,         # [N] RMSE，单位 dB
+        mae_db=mae_db,           # [N] MAE，单位 dB
+        model_name=np.asarray(model_name),
+        split=np.asarray(split),
+        metric_scope=np.asarray(metric_scope),
+    )
+    print(f"已保存逐样本 RMSE 和 MAE：{path}（{len(sample_ids)} 条）", flush=True)
+    return path
+
+
+@torch.inference_mode()
+def run_evaluation(split=SPLIT, sample_ids=None, evaluate_full_split=EVALUATE_FULL_SPLIT,
+                   data_dir=DATA_DIR, checkpoint=CHECKPOINT, reference_bank=None,
+                   output_dir=OUTPUT_DIR, batch_size=BATCH_SIZE,
+                   num_workers=NUM_WORKERS, amp=AMP, angle_chunk=ANGLE_CHUNK):
+    data_dir, checkpoint = Path(data_dir), Path(checkpoint)
+    output_dir = Path(output_dir)
+    reference_bank = Path(reference_bank) if reference_bank is not None else checkpoint.parent/'reference_bank.npz'
+    if split not in SPLIT_SLICES:
+        raise ValueError('split must be train/val/test')
+    if not 1 <= angle_chunk <= 9 or batch_size < 1 or num_workers < 0:
+        raise ValueError('invalid angle_chunk/batch_size/num_workers')
+    if amp not in ('auto','bf16','fp16','off'):
+        raise ValueError('invalid AMP mode')
+    ids = sorted(set(map(int,
+        ([] if evaluate_full_split and sample_ids is None else
+         SAMPLE_IDS if sample_ids is None else sample_ids))))
+    lo, hi = SPLIT_SLICES[split]
+    if any(not lo <= sid < hi for sid in ids) or (not ids and not evaluate_full_split):
+        raise ValueError(f'sample IDs must be in [{lo},{hi-1}]; subset cannot be empty')
+    if not checkpoint.is_file() or not reference_bank.is_file():
+        raise FileNotFoundError('Both Stage II checkpoint and its reference_bank.npz are required')
+    check_files(data_dir)
+    ckpt = torch.load(checkpoint, map_location='cpu', weights_only=False,
+                      pickle_module=CrossPlatformPickle)
+    if ckpt.get('stage') != 'correct':
+        raise ValueError('Only Stage II correction checkpoints predict from SSP+Bathymetry')
+    if ckpt.get('reference_sha256') != file_sha256(reference_bank):
+        raise ValueError('Reference bank SHA256 mismatch')
+    if ckpt.get('loss_policy') != LOSS_POLICY:
+        raise ValueError('Checkpoint was NOT trained with the no-mask full-grid objective')
+    stats = ckpt['stats']
+    if stats.get('tl_statistics_region') != 'all_grid_points' or stats.get('loss_policy') != LOSS_POLICY:
+        raise ValueError('Checkpoint stats are incompatible; retrain from full-grid statistics')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if amp == 'auto':
+        amp = 'bf16' if device.type == 'cuda' and torch.cuda.is_bf16_supported() else 'fp16'
+    if device.type == 'cuda' and amp == 'bf16' and not torch.cuda.is_bf16_supported():
+        raise RuntimeError('GPU does not support BF16')
+    model = build_model(reference_bank, stats).to(device)
+    model.load_state_dict(ckpt['model'], strict=True)
+    if ckpt.get('parameter_count') not in (None, count_parameters(model)):
+        raise ValueError('Checkpoint parameter count mismatch')
+    model.eval()
+    ds = TLDataset(data_dir, split, tl_invalid_raw=stats.get('tl_invalid_raw'),
+                   invalid_target_fill_db=stats.get('invalid_target_fill_db'), check=False)
+    if not evaluate_full_split:
+        ds = Subset(ds, [sid-lo for sid in ids])
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+                        pin_memory=device.type == 'cuda')
+    bottom = _load_bottom_index(data_dir, device)
+    metrics = MaskedMetrics(device)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    export_ids = set(ids)
+    depth_max_m = float(ckpt.get('args', {}).get('depth_max_m',4000.))
+    range_max_m = float(ckpt.get('args', {}).get('range_max_m',50000.))
+    # 逐样本 RMSE/MAE 仅保存三个长度为 N 的向量，不缓存整个 TL 预测张量。
+    collected_sample_ids = []
+    collected_sample_rmse = []
+    collected_sample_mae = []
+    for step, (ssp, bathy, truth_db, raw_ids) in enumerate(loader, 1):
+        ssp = ssp.to(device, non_blocking=True)
+        bathy = bathy.to(device, non_blocking=True)
+        truth_db = truth_db.to(device, non_blocking=True)
+        ctx = (torch.autocast('cuda', dtype=torch.bfloat16 if amp=='bf16' else torch.float16)
+               if device.type == 'cuda' and amp != 'off' else nullcontext())
+        with ctx:
+            pred_db = model.predict_db(ssp,bathy,angle_chunk=angle_chunk).float()
+        mask = water_valid_mask(truth_db, raw_ids, bottom)
+        metrics.add(pred_db, truth_db, mask)
+        batch_rmse, batch_mae = _sample_rmse_mae_db(pred_db, truth_db, mask)
+        collected_sample_ids.extend(raw_ids.detach().cpu().tolist())
+        collected_sample_rmse.extend(batch_rmse.tolist())
+        collected_sample_mae.extend(batch_mae.tolist())
+
+        for j, sid in enumerate(raw_ids.tolist()):
+            if sid not in export_ids:
+                continue
+            path = output_dir / f'{split}_sample_{sid}.npz'
+            m = mask[j].cpu().numpy()
+            np.savez_compressed(path,
+                truth_db=np.where(m, truth_db[j].cpu().numpy(), np.nan),
+                pred_db=np.where(m, pred_db[j].cpu().numpy(), np.nan),
+                valid_mask=m,
+                sample_id=sid, source_idx=sid%121,
+                reference_sample_id=sid%121,
+                angles_deg=np.arange(9)*40,
+                depth_m=np.linspace(0,depth_max_m,200),
+                range_m=np.linspace(0,range_max_m,250),
+                grid_scope='water_mask', checkpoint_epoch=int(ckpt.get('epoch',-1))+1)
+            print('已导出：',path,flush=True)
+        if evaluate_full_split and (step%100==0 or step==len(loader)):
+            print(f'评估进度：{min(step*batch_size,len(ds))}/{len(ds)}',flush=True)
+    # 整个 test 集按全局样本编号排序，一一对应保存 RMSE/MAE(dB)。
+    _save_sample_errors(
+        output_dir, "AGLC_Net_sample_errors.npz", "AGLC-Net",
+        split, lo, hi, evaluate_full_split,
+        collected_sample_ids, collected_sample_rmse, collected_sample_mae,
+        metric_scope="water_mask",
+    )
+
+    result = metrics.result()
+    report = {'split':split, 'checkpoint':str(checkpoint),
+              'reference_bank':str(reference_bank),
+              'reference_samples':'year-1 month-1, original IDs 0..120 (TRAIN only)',
+              'reference_assisted_extra_training_TL':True,
+              'checkpoint_epoch':int(ckpt.get('epoch',-1))+1,
+              'model_name':MODEL_ARCHITECTURE,
+              'model_parameters':count_parameters(model),
+              'evaluated_samples':len(ds), 'is_exported_subset':not evaluate_full_split,
+              'sample_ids_exported':ids, 'units':'dB',
+              'evaluation_scope':'water_mask','loss_policy':LOSS_POLICY,
+              'coordinate_assumption':{'depth_max_m':depth_max_m,'range_max_m':range_max_m},
+              **result}
+    name = f'{split}_{"metrics_db" if evaluate_full_split else "exported_subset_metrics_db"}.json'
+    (output_dir/name).write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+    print('有效水体dB误差：',result['overall'],flush=True)
+    if not evaluate_full_split:
+        print('注意：以上仅为指定样本误差，不代表整个测试集。',flush=True)
+    return report
+
+
+def main():
+    p=argparse.ArgumentParser(description='Evaluate AGLC-Net on valid water cells (same mask as MAP-Net)')
+    p.add_argument('--split',choices=list(SPLIT_SLICES),default=SPLIT)
+    p.add_argument('--full-split',action='store_true', default=EVALUATE_FULL_SPLIT)
+    p.add_argument("--subset", dest="full_split", action="store_false",
+                          help="仅评价 --export-ids 指定样本（不评价整个划分）")
+    p.add_argument('--export-ids','--sample-ids',dest='sample_ids',default=None)
+    p.add_argument('--data-dir',type=Path,default=DATA_DIR)
+    p.add_argument('--checkpoint',type=Path,default=CHECKPOINT)
+    p.add_argument('--reference-bank',type=Path,default=None)
+    p.add_argument('--output-dir',type=Path,default=OUTPUT_DIR)
+    p.add_argument('--batch-size',type=int,default=BATCH_SIZE)
+    p.add_argument('--workers',type=int,default=NUM_WORKERS)
+    p.add_argument('--amp',choices=('auto','bf16','fp16','off'),default=AMP)
+    p.add_argument('--angle-chunk',type=int,default=ANGLE_CHUNK)
+    args=p.parse_args()
+    ids = [] if args.full_split and args.sample_ids is None else \
+        SAMPLE_IDS if args.sample_ids is None else \
+        [int(x.strip()) for x in args.sample_ids.split(',') if x.strip()]
+    run_evaluation(split=args.split, sample_ids=ids, evaluate_full_split=args.full_split,
+                   data_dir=args.data_dir, checkpoint=args.checkpoint, reference_bank=args.reference_bank,
+                   output_dir=args.output_dir, batch_size=args.batch_size,
+                   num_workers=args.workers, amp=args.amp, angle_chunk=args.angle_chunk)
+
+
+if __name__=='__main__':
+    main()

@@ -1,0 +1,4 @@
+numpy>=1.24,<3
+# Install an appropriate CUDA-enabled PyTorch build separately if needed.
+torch>=2.2
+matplotlib>=3.7
